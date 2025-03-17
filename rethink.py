@@ -1,7 +1,11 @@
 import sys
 import os
-# Placeholder import simulating the new agents SDK
-from agents import Agent, Runner
+import asyncio
+import uuid
+
+from agents import Agent, Runner, RawResponsesStreamEvent
+from openai.types.responses import ResponseTextDeltaEvent, ResponseContentPartDoneEvent
+
 import openai
 import tkinter as tk
 from tkinter import scrolledtext
@@ -45,62 +49,111 @@ class RethinkUI:
         
         # Show loading indicator
         self.text_output.delete("1.0", tk.END)
-        self.text_output.insert(tk.END, "Processing your request, please wait...")
+        self.text_output.insert(tk.END, "Processing your request, please wait...\n")
         self.submit_button.config(state=tk.DISABLED)
         self.root.update()
-        
-        try:
-            result = run_rethink_agent(input_text)
-            self.text_output.delete("1.0", tk.END)
-            self.text_output.insert(tk.END, result)
-        except Exception as e:
-            self.text_output.delete("1.0", tk.END)
-            self.text_output.insert(tk.END, f"Error: {str(e)}")
-        finally:
-            self.submit_button.config(state=tk.NORMAL)
 
-def run_rethink_agent(user_input):
-    RETHINK_SUBAGENT_SYSTEM_MESSAGE = '''
-    Your job is to take a message and rethink it. You will be given a message and you will need to provide a nuanced, rethought perspective.
-    '''
+        # Define a callback to log each iteration.
+        def log_iteration(iteration, message):
+            log_message = f"Iteration {iteration}: {message}\n"
+            self.text_output.insert(tk.END, log_message)
+            self.text_output.see(tk.END)
+            self.root.update_idletasks()
 
-    rethink_subagent = Agent(name="Rethinking Subagent", model="gpt-4o", instructions=RETHINK_SUBAGENT_SYSTEM_MESSAGE)
+        async def run_and_log():
+            try:
+                result = await run_rethink_agent_async(input_text, log_callback=log_iteration)
+                self.text_output.insert(tk.END, f"\nFinal Answer: {result}")
+            except Exception as e:
+                self.text_output.insert(tk.END, f"Error: {str(e)}")
+            finally:
+                self.submit_button.config(state=tk.NORMAL)
 
-    final_answer_system_message = '''
-    Aggregate and summarize these iterative critiques into one concise and refined final answer.
-    '''
+        asyncio.run(run_and_log())
 
-    final_answer_agent = Agent(name="Final Answer Agent", model="gpt-4o", instructions=final_answer_system_message)
-
-    ORCHESTRATOR_SYSTEM_MESSAGE= '''
-    Your job is to take a message and rethink it. You will be given a message and you will need to provide a nuanced, rethought perspective.
-    You will have 5 iterations to provide a refined answer.
-    At the end you will need to aggregate and summarize these iterative critiques into one concise and refined final answer.
-    '''
-
-    orchestrator = Agent(
-        name="Orchestrator", 
-        model="gpt-4o", 
-        instructions=ORCHESTRATOR_SYSTEM_MESSAGE, 
-        tools=[
-            rethink_subagent.as_tool(tool_name='rethink',tool_description='iterative rethinking subagent'), 
-            final_answer_agent.as_tool(tool_name='finalize',tool_description='after the rethink iterations produces a final answer')]
+async def run_rethink_agent_async(user_input, log_callback=None):
+    # Build the necessary agents
+    RETHINK_SUBAGENT_SYSTEM_MESSAGE = (
+        "Your job is to take a message and rethink it. "
+        "You will be given a message and you will need to provide a nuanced, rethought perspective."
     )
-    
-    result = Runner.run_sync(orchestrator, user_input)
-    return result.final_output
+    rethink_subagent = Agent(
+        name="Rethinking Subagent",
+        model="gpt-4o",
+        instructions=RETHINK_SUBAGENT_SYSTEM_MESSAGE
+    )
+
+    final_answer_system_message = (
+        "Aggregate and summarize these iterative critiques into one concise and refined final answer."
+    )
+    final_answer_agent = Agent(
+        name="Final Answer Agent",
+        model="gpt-4o",
+        instructions=final_answer_system_message
+    )
+
+    ORCHESTRATOR_SYSTEM_MESSAGE = (
+        "Your job is to take a message and rethink it. You will be given a message and you will need to provide a nuanced, rethought perspective. "
+        "You will have 5 iterations to provide a refined answer. "
+        "At the end you will need to aggregate and summarize these iterative critiques into one concise and refined final answer."
+    )
+    orchestrator = Agent(
+        name="Orchestrator",
+        model="gpt-4o",
+        instructions=ORCHESTRATOR_SYSTEM_MESSAGE,
+        tools=[
+            rethink_subagent.as_tool(
+                tool_name='rethink',
+                tool_description='iterative rethinking subagent'
+            ),
+            final_answer_agent.as_tool(
+                tool_name='finalize',
+                tool_description='after the rethink iterations produces a final answer'
+            )
+        ]
+    )
+
+    # Start with initial user input as a conversation input.
+    inputs = [{"content": user_input, "role": "user"}]
+    final_answer = ""
+    total_iterations = 5  # as per orchestrator's instructions
+
+    for i in range(total_iterations):
+        result = Runner.run_streamed(orchestrator, input=inputs)
+        iteration_log = ""
+        # Process the stream for one iteration, updating the log continuously.
+        async for event in result.stream_events():
+            if not isinstance(event, RawResponsesStreamEvent):
+                continue
+
+            data = event.data
+            if isinstance(data, ResponseTextDeltaEvent):
+                delta = data.delta
+                iteration_log += delta
+                if log_callback:
+                    # Update the current iteration's log (without forcing a new line)
+                    log_callback(i+1, iteration_log)
+            elif isinstance(data, ResponseContentPartDoneEvent):
+                # End of this iteration's response part.
+                if log_callback:
+                    log_callback(i+1, iteration_log + "\n")
+                break  # Move on to the next iteration
+
+        # Update inputs for the next iteration.
+        inputs = result.to_input_list() if hasattr(result, "to_input_list") else inputs
+        final_answer = iteration_log
+
+    return final_answer
 
 def main():
     if len(sys.argv) > 1:
-        # Command-line mode
         user_input = sys.argv[1]
-        result = run_rethink_agent(user_input)
-        print(result)
+        output = asyncio.run(run_rethink_agent_async(user_input))
+        print(output)
     else:
-        # GUI mode
         root = tk.Tk()
         app = RethinkUI(root)
         root.mainloop()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
